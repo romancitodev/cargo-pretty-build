@@ -14,7 +14,13 @@ pub fn host_triple() -> Option<String> {
 /// `RUSTC_BOOTSTRAP=1` is cargo's own sanctioned escape hatch for using it on stable.
 pub fn exact_unit_count(extra_args: &[String]) -> Option<usize> {
     let output = Command::new("cargo")
-        .args(["build", "--unit-graph", "-Z", "unstable-options", "--message-format=json"])
+        .args([
+            "build",
+            "--unit-graph",
+            "-Z",
+            "unstable-options",
+            "--message-format=json",
+        ])
         .args(extra_args)
         .env("RUSTC_BOOTSTRAP", "1")
         .output()

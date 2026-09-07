@@ -3,8 +3,8 @@ use std::process::{Command, Stdio};
 
 use std::collections::HashMap;
 
-use cargo_metadata::diagnostic::{Diagnostic, DiagnosticLevel};
 use cargo_metadata::Message;
+use cargo_metadata::diagnostic::{Diagnostic, DiagnosticLevel};
 use nobubbles::effects::Emitter;
 
 pub struct Warning {
@@ -80,7 +80,10 @@ pub fn build(tx: &Emitter<Event>, names: &HashMap<String, String>, extra_args: &
     let stderr_tx = tx.clone();
     let stderr_thread = std::thread::spawn(move || {
         let mut full = String::new();
-        for line in BufReader::new(stderr).lines().map_while(std::io::Result::ok) {
+        for line in BufReader::new(stderr)
+            .lines()
+            .map_while(std::io::Result::ok)
+        {
             let clean = strip_ansi(&line);
             if let Some(rest) = clean.trim_start().strip_prefix("Compiling ")
                 && let Some(name) = rest.split_whitespace().next()
