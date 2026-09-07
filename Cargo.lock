@@ -455,8 +455,9 @@ dependencies = [
 
 [[package]]
 name = "nobubbles"
-version = "0.1.0"
-source = "git+https://github.com/romancitodev/nobubbles?branch=feat%2Frimel#39ca32b79eff9858d1267c12379856251866e5b0"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5ff3438263250d282b740cf954a65665845743f82668eb6c4de01763b686af2b"
 dependencies = [
  "crossterm",
  "eyre",
@@ -468,8 +469,9 @@ dependencies = [
 
 [[package]]
 name = "norimel"
-version = "0.1.0"
-source = "git+https://github.com/romancitodev/nobubbles?branch=feat%2Frimel#39ca32b79eff9858d1267c12379856251866e5b0"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f7d8b322f404eea16e474b2ed1e1f2c344db702ed0e892fefe0ff5b296ebf2b0"
 dependencies = [
  "colorgrad",
  "crossterm",

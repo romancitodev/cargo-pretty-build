@@ -13,4 +13,4 @@ colorgrad = "0.8"
 crossterm = "0.29"
 eyre = "0.6"
 serde_json = "1"
-nobubbles = { git = "https://github.com/romancitodev/nobubbles", branch = "feat/rimel", features = ["gradient"] }
+nobubbles = { version = "0.1.1", features = ["gradient"] }
