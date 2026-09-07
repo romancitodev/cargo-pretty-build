@@ -3,6 +3,8 @@
 A `cargo build` wrapper with a live status view: which crates are compiling right now, how
 long each one took, and a progress bar driven by cargo's own unit graph instead of a guess.
 
+<video src="assets/cargo-pretty-itself.mp4" controls></video>
+
 ## Install
 
 ```bash
