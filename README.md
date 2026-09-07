@@ -1,9 +1,13 @@
+
+
+
+
 # cargo-pretty-build
 
 A `cargo build` wrapper with a live status view: which crates are compiling right now, how
 long each one took, and a progress bar driven by cargo's own unit graph instead of a guess.
 
-<video src="assets/cargo-pretty-itself.mp4" controls></video>
+<video src="https://github.com/user-attachments/assets/3d2ed6bc-21c0-4800-bcea-35ded96518d2" controls></video>
 
 ## Install
 
