@@ -4,7 +4,7 @@ description = "A cargo build wrapper with a live, animated status view"
 repository = "https://github.com/romancitodev/cargo-pretty-build"
 authors = ["romancitodev"]
 license = "MIT"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 
 [dependencies]
