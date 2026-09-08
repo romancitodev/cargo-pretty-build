@@ -17,7 +17,11 @@ pub fn rust_ramp() -> Ramp {
 /// for a list where older rows recede and the newest stands out.
 pub fn fade(block: rimel::Block, alpha: f32) -> rimel::Block {
     block.map_cells(move |_, _, style| {
-        let fg = if style.fg == rimel::Color::Reset { palette::TEXT } else { style.fg };
+        let fg = if style.fg == rimel::Color::Reset {
+            palette::TEXT
+        } else {
+            style.fg
+        };
         style.fg(rimel::blend(fg, palette::BASE, alpha))
     })
 }
