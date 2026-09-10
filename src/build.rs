@@ -67,7 +67,9 @@ pub enum Event {
     /// before this ever gets sent, so it never needs this event at all.
     Executables(Vec<PathBuf>),
     /// One test binary is about to run; carries how many tests it holds, added to the total.
-    SuiteStarted { total: usize },
+    SuiteStarted {
+        total: usize,
+    },
     TestStarted(String),
     TestFinished {
         name: String,

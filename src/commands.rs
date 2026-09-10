@@ -5,10 +5,14 @@
 pub enum Verb {
     Build,
     /// Carries the argv to hand to the built binary, taken from after a `--` separator.
-    Run { program_args: Vec<String> },
+    Run {
+        program_args: Vec<String>,
+    },
     /// Carries the libtest harness args (test name filter, `--no-fail-fast`, ...), also taken
     /// from after a `--` separator.
-    Test { harness_args: Vec<String> },
+    Test {
+        harness_args: Vec<String>,
+    },
 }
 
 impl Verb {

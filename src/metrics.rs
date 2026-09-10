@@ -15,7 +15,12 @@ pub fn host_triple() -> Option<String> {
 pub fn exact_unit_count(cargo_args: &[&str], extra_args: &[String]) -> Option<usize> {
     let output = Command::new("cargo")
         .args(cargo_args)
-        .args(["--unit-graph", "-Z", "unstable-options", "--message-format=json"])
+        .args([
+            "--unit-graph",
+            "-Z",
+            "unstable-options",
+            "--message-format=json",
+        ])
         .args(extra_args)
         .env("RUSTC_BOOTSTRAP", "1")
         .output()

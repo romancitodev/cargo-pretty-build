@@ -30,7 +30,13 @@ pub fn run(tx: &Emitter<Event>, binaries: &[PathBuf], harness_args: &[String]) -
 /// already shown for compilation.
 fn run_one(tx: &Emitter<Event>, path: &Path, harness_args: &[String]) -> bool {
     let mut child = Command::new(path)
-        .args(["--format", "json", "-Z", "unstable-options", "--report-time"])
+        .args([
+            "--format",
+            "json",
+            "-Z",
+            "unstable-options",
+            "--report-time",
+        ])
         .args(harness_args)
         .env("RUSTC_BOOTSTRAP", "1")
         .stdout(Stdio::piped())
@@ -70,7 +76,11 @@ fn run_one(tx: &Emitter<Event>, path: &Path, harness_args: &[String]) -> bool {
                         Outcome::Failed { location, stdout }
                     }
                 };
-                tx.send(Event::TestFinished { name, secs, outcome });
+                tx.send(Event::TestFinished {
+                    name,
+                    secs,
+                    outcome,
+                });
             }
             _ => {}
         }

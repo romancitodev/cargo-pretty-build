@@ -367,7 +367,11 @@ fn main() -> Result<()> {
 
         // Accordion over every failed test, not a one-at-a-time viewer: all rows stay visible,
         // ↑↓ only move which row is highlighted, Enter expands/collapses that row in place.
-        if is_test && settled && !failed.is_empty() && let Some(k) = cx.key() {
+        if is_test
+            && settled
+            && !failed.is_empty()
+            && let Some(k) = cx.key()
+        {
             match k.code {
                 KeyCode::Up => failed_selected = failed_selected.saturating_sub(1),
                 KeyCode::Down => {
