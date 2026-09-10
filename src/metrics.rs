@@ -12,15 +12,10 @@ pub fn host_triple() -> Option<String> {
 
 /// Exact unit count straight from cargo's own unit graph. `--unit-graph` is nightly-only, but
 /// `RUSTC_BOOTSTRAP=1` is cargo's own sanctioned escape hatch for using it on stable.
-pub fn exact_unit_count(extra_args: &[String]) -> Option<usize> {
+pub fn exact_unit_count(cargo_args: &[&str], extra_args: &[String]) -> Option<usize> {
     let output = Command::new("cargo")
-        .args([
-            "build",
-            "--unit-graph",
-            "-Z",
-            "unstable-options",
-            "--message-format=json",
-        ])
+        .args(cargo_args)
+        .args(["--unit-graph", "-Z", "unstable-options", "--message-format=json"])
         .args(extra_args)
         .env("RUSTC_BOOTSTRAP", "1")
         .output()

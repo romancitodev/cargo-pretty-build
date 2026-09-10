@@ -1,6 +1,6 @@
 [package]
-name = "cargo-pretty-build"
-description = "A cargo build wrapper with a live, animated status view"
+name = "cargo-pretty"
+description = "A cargo wrapper with a live, animated status view for build/test/run/check"
 repository = "https://github.com/romancitodev/cargo-pretty-build"
 authors = ["romancitodev"]
 license = "MIT"

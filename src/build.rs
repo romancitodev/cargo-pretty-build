@@ -1,4 +1,5 @@
 use std::io::{BufRead, BufReader};
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
 use std::collections::HashMap;
@@ -12,6 +13,27 @@ pub struct Warning {
     pub location: Option<String>,
     pub help: Option<String>,
     pub rendered: String,
+}
+
+/// One failed test, collected for the post-run browsable list.
+pub struct FailedTest {
+    pub name: String,
+    pub secs: f32,
+    pub location: Option<String>,
+    pub stdout: String,
+}
+
+/// Outcome of one finished test, carrying just enough to render inline and, on failure, to
+/// inspect on demand.
+pub enum Outcome {
+    Passed,
+    Ignored,
+    Failed {
+        /// `file:line` pulled out of the panic message, when there is one to point at.
+        location: Option<String>,
+        /// Captured stdout for the test, panic message included.
+        stdout: String,
+    },
 }
 
 pub enum Event {
@@ -40,6 +62,18 @@ pub enum Event {
     },
     Warning(Warning),
     Error(String),
+    /// Sent once compilation finishes, only when the verb needs the produced binaries
+    /// afterward: `run` execs the one it finds here; `test` runs every one of them itself
+    /// before this ever gets sent, so it never needs this event at all.
+    Executables(Vec<PathBuf>),
+    /// One test binary is about to run; carries how many tests it holds, added to the total.
+    SuiteStarted { total: usize },
+    TestStarted(String),
+    TestFinished {
+        name: String,
+        secs: f32,
+        outcome: Outcome,
+    },
     Done(bool),
 }
 
@@ -78,9 +112,19 @@ fn to_warning(d: &Diagnostic) -> Warning {
     }
 }
 
-pub fn build(tx: &Emitter<Event>, names: &HashMap<String, String>, extra_args: &[String]) {
+/// Compiles with `cargo <cargo_args> --message-format=json <extra_args>` and streams progress
+/// as [`Event`]s. Returns whether it succeeded and every runnable artifact it produced (bins,
+/// examples, test binaries), in the order cargo built them. The caller decides what to do with
+/// those (`run` executes the one it found, `test` runs every one of them itself).
+pub fn build(
+    tx: &Emitter<Event>,
+    names: &HashMap<String, String>,
+    cargo_args: &[&str],
+    extra_args: &[String],
+) -> (bool, Vec<PathBuf>) {
     let mut child = Command::new("cargo")
-        .args(["build", "--message-format=json", "--color=always"])
+        .args(cargo_args)
+        .args(["--message-format=json", "--color=always"])
         .args(extra_args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -111,11 +155,15 @@ pub fn build(tx: &Emitter<Event>, names: &HashMap<String, String>, extra_args: &
 
     let reader = BufReader::new(child.stdout.take().unwrap());
     let mut ok = true;
+    let mut executables = Vec::new();
 
     for message in Message::parse_stream(reader).flatten() {
         match message {
             Message::CompilerArtifact(artifact) => {
                 let fresh = artifact.fresh;
+                if let Some(path) = artifact.executable {
+                    executables.push(path.into_std_path_buf());
+                }
                 let is_build_script = artifact
                     .target
                     .is_kind(cargo_metadata::TargetKind::CustomBuild);
@@ -161,5 +209,5 @@ pub fn build(tx: &Emitter<Event>, names: &HashMap<String, String>, extra_args: &
     if !ok && !stderr_text.trim().is_empty() {
         tx.send(Event::Error(stderr_text));
     }
-    tx.send(Event::Done(ok));
+    (ok, executables)
 }
