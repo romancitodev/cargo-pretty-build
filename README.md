@@ -1,6 +1,6 @@
 # cargo-pretty
 
-![Check Format and Code Quality](https://github.com/romancitodev/cargo-pretty-build/actions/workflows/checks.yml/badge.svg)
+![Check Format and Code Quality](https://github.com/romancitodev/cargo-pretty/actions/workflows/checks.yml/badge.svg)
 ![license](https://img.shields.io/badge/license-MIT-blue.svg)
 
 Cargo's own build output does the job. This does it prettier: a live status view for
@@ -18,7 +18,7 @@ guess.
 ## Install
 
 ```bash
-cargo install --git https://github.com/romancitodev/cargo-pretty-build
+cargo install --git https://github.com/romancitodev/cargo-pretty
 ```
 
 ## Usage
