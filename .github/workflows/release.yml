@@ -44,7 +44,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: taiki-e/upload-rust-binary-action@v1
         with:
-          bin: cargo-pretty-build
+          bin: cargo-pretty
           target: ${{ matrix.target }}
           archive: $bin-$target
           token: ${{ secrets.GITHUB_TOKEN }}

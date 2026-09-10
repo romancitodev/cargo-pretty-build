@@ -36,7 +36,7 @@ fn main() -> Result<()> {
     let mut extra_args: Vec<String> = std::env::args().skip(1).collect();
     // When cargo dispatches `cargo pretty ...`, it prepends the subcommand name to argv,
     // so it'd otherwise get forwarded into the wrapped cargo command as if the user had typed it.
-    if let Some(subcommand) = env!("CARGO_PKG_NAME").strip_prefix("cargo-")
+    if let Some(subcommand) = env!("CARGO_BIN_NAME").strip_prefix("cargo-")
         && extra_args.first().map(String::as_str) == Some(subcommand)
     {
         extra_args.remove(0);
