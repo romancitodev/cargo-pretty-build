@@ -15,10 +15,23 @@ pub struct Warning {
 }
 
 pub enum Event {
+    /// Sent once `cargo metadata` resolves, so the UI can swap its startup placeholders for
+    /// the real project name and (a first estimate of) the unit total.
+    Ready {
+        project: String,
+        target_dir: std::path::PathBuf,
+        total: usize,
+        versions: HashMap<String, String>,
+    },
+    /// A more exact unit count than `Ready`'s, from cargo's own unit graph. Arrives later
+    /// because it costs its own `cargo` invocation, run only after the real build is under way.
+    Total(usize),
     Started(String),
+    /// The build script binary has been compiled and cargo is about to run it.
+    ScriptRunning(String),
     /// Build scripts finish before the package's real lib/bin, so they get their own
     /// completion event instead of an `Artifact` for the "building" indicator to clear on.
-    ScriptExecuted,
+    ScriptExecuted(String),
     Artifact {
         id: String,
         name: String,
@@ -103,14 +116,18 @@ pub fn build(tx: &Emitter<Event>, names: &HashMap<String, String>, extra_args: &
         match message {
             Message::CompilerArtifact(artifact) => {
                 let fresh = artifact.fresh;
-                let real = !artifact
+                let is_build_script = artifact
                     .target
                     .is_kind(cargo_metadata::TargetKind::CustomBuild);
+                let real = !is_build_script;
                 let id = artifact.package_id.repr.clone();
                 let name = names
                     .get(id.as_str())
                     .cloned()
                     .unwrap_or(artifact.target.name);
+                if is_build_script && !fresh {
+                    tx.send(Event::ScriptRunning(name.clone()));
+                }
                 tx.send(Event::Artifact {
                     id,
                     name,
@@ -118,7 +135,13 @@ pub fn build(tx: &Emitter<Event>, names: &HashMap<String, String>, extra_args: &
                     real,
                 });
             }
-            Message::BuildScriptExecuted(_) => tx.send(Event::ScriptExecuted),
+            Message::BuildScriptExecuted(script) => {
+                let name = names
+                    .get(script.package_id.repr.as_str())
+                    .cloned()
+                    .unwrap_or(script.package_id.repr);
+                tx.send(Event::ScriptExecuted(name));
+            }
             Message::CompilerMessage(msg) => match msg.message.level {
                 DiagnosticLevel::Error => {
                     if let Some(rendered) = msg.message.rendered {

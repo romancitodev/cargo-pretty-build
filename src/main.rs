@@ -3,12 +3,13 @@ mod metrics;
 mod ui;
 
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::time::Instant;
 
 use cargo_metadata::MetadataCommand;
 use crossterm::event::KeyCode;
 use eyre::Result;
-use nobubbles::app::Inline;
+use nobubbles::app::{Cancelled, Inline};
 use nobubbles::effects;
 use nobubbles::rimel;
 use nobubbles::signals::{quit, signal};
@@ -18,6 +19,7 @@ use metrics::{build_closure_size, dir_size, exact_unit_count, host_triple};
 use ui::{fade, rust_ramp, summary_block, warning_panel};
 
 const BAR_WIDTH: u16 = 28;
+const NAME_WIDTH: usize = 32;
 const BUILDING_ROWS: usize = 6;
 const DONE_ROWS: usize = 6;
 /// Writing this signal every frame is what keeps nobubbles' reactive loop ticking during the
@@ -25,15 +27,6 @@ const DONE_ROWS: usize = 6;
 const SETTLE_STEP: f32 = 0.125;
 
 fn main() -> Result<()> {
-    let mut metadata_cmd = MetadataCommand::new();
-    if let Some(triple) = host_triple() {
-        metadata_cmd.other_options(vec!["--filter-platform".to_string(), triple]);
-    }
-    let metadata = metadata_cmd.exec()?;
-    let project = metadata
-        .root_package()
-        .map(|p| p.name.to_string())
-        .unwrap_or_else(|| "project".into());
     let mut extra_args: Vec<String> = std::env::args().skip(1).collect();
     // When cargo dispatches `cargo pretty-build ...`, it prepends the subcommand name to argv,
     // so it'd otherwise get forwarded into `cargo build` as if the user had typed it.
@@ -42,33 +35,84 @@ fn main() -> Result<()> {
     {
         extra_args.remove(0);
     }
-    let total = exact_unit_count(&extra_args).unwrap_or_else(|| build_closure_size(&metadata));
-    let names: HashMap<String, String> = metadata
-        .packages
-        .iter()
-        .map(|p| (p.id.repr.clone(), p.name.to_string()))
-        .collect();
-    let target_dir = metadata.target_directory.clone().into_std_path_buf();
-
     let flag_line = if extra_args.is_empty() {
         "cargo build".to_string()
     } else {
         format!("cargo build {}", extra_args.join(" "))
     };
 
+    // `cargo metadata` and the unit count both cost their own subprocess, so none of that runs
+    // before the UI does — the loop below draws its first frame immediately, on placeholders,
+    // while this background thread resolves the real project name, target dir and unit total
+    // and only then hands off to the actual `cargo build`.
     let inbox = effects::inbox::<Event>();
-    let build_args = extra_args.clone();
-    inbox.spawn(move |tx| build(&tx, &names, &build_args));
+    let setup_args = extra_args.clone();
+    inbox.spawn(move |tx| {
+        let mut metadata_cmd = MetadataCommand::new();
+        if let Some(triple) = host_triple() {
+            metadata_cmd.other_options(vec!["--filter-platform".to_string(), triple]);
+        }
+        let metadata = match metadata_cmd.exec() {
+            Ok(m) => m,
+            Err(e) => {
+                tx.send(Event::Error(e.to_string()));
+                tx.send(Event::Done(false));
+                return;
+            }
+        };
 
-    // taken after spawning the build, so this walk overlaps with cargo starting up
-    let before_size = dir_size(&target_dir);
+        let project = metadata
+            .root_package()
+            .map(|p| p.name.to_string())
+            .unwrap_or_else(|| "project".into());
+        let names: HashMap<String, String> = metadata
+            .packages
+            .iter()
+            .map(|p| (p.id.repr.clone(), p.name.to_string()))
+            .collect();
+        // Keyed by name rather than package id: that's what every event carries a crate's
+        // identity as (cargo's own stderr/JSON output never mentions ids), so this is the
+        // only key the render loop can actually look version up by.
+        let versions: HashMap<String, String> = metadata
+            .packages
+            .iter()
+            .map(|p| (p.name.to_string(), p.version.to_string()))
+            .collect();
+        let target_dir = metadata.target_directory.clone().into_std_path_buf();
+        let total = build_closure_size(&metadata);
+
+        tx.send(Event::Ready {
+            project,
+            target_dir,
+            total,
+            versions,
+        });
+
+        // A more exact count needs its own `cargo` invocation, so it runs alongside the real
+        // build instead of delaying it; `total` above is close enough to draw a bar meanwhile.
+        let unit_tx = tx.clone();
+        let unit_args = setup_args.clone();
+        std::thread::spawn(move || {
+            if let Some(total) = exact_unit_count(&unit_args) {
+                unit_tx.send(Event::Total(total));
+            }
+        });
+
+        build(&tx, &names, &setup_args);
+    });
 
     let started = Instant::now();
     let settle_t = signal(0.0f32);
     let dismissing = signal(false);
+    let mut project = String::new();
+    let mut target_dir: Option<PathBuf> = None;
+    let mut before_size = 0u64;
+    let mut total = 0usize;
+    let mut versions: HashMap<String, String> = HashMap::new();
     let mut compiled: HashSet<String> = HashSet::new();
     let mut seen = 0usize;
-    let mut building: Vec<(String, Instant)> = Vec::new();
+    // (crate name, started, running its build.rs right now?)
+    let mut building: Vec<(String, Instant, bool)> = Vec::new();
     let mut done: Vec<(String, f32)> = Vec::new();
     let mut warnings: Vec<Warning> = Vec::new();
     let mut errors: Vec<String> = Vec::new();
@@ -77,14 +121,37 @@ fn main() -> Result<()> {
     let mut selected = 0usize;
     let mut inspecting = false;
 
-    Inline::run(20, |cx| {
+    let run = Inline::run(20, |cx| {
         inbox.drain(|event| match event {
+            Event::Ready {
+                project: p,
+                target_dir: dir,
+                total: t,
+                versions: v,
+            } => {
+                project = p;
+                before_size = dir_size(&dir);
+                target_dir = Some(dir);
+                total = t;
+                versions = v;
+            }
+            Event::Total(t) => total = t,
             Event::Started(name) => {
-                if !building.iter().any(|(n, _)| n == &name) {
-                    building.push((name, Instant::now()));
+                if !building.iter().any(|(n, _, _)| n == &name) {
+                    building.push((name, Instant::now(), false));
                 }
             }
-            Event::ScriptExecuted => seen += 1,
+            Event::ScriptRunning(name) => {
+                if let Some(entry) = building.iter_mut().find(|(n, _, _)| n == &name) {
+                    entry.2 = true;
+                }
+            }
+            Event::ScriptExecuted(name) => {
+                seen += 1;
+                if let Some(entry) = building.iter_mut().find(|(n, _, _)| n == &name) {
+                    entry.2 = false;
+                }
+            }
             Event::Artifact {
                 id,
                 name,
@@ -95,7 +162,7 @@ fn main() -> Result<()> {
                 if !fresh {
                     compiled.insert(id);
                     if real {
-                        let secs = match building.iter().position(|(n, _)| n == &name) {
+                        let secs = match building.iter().position(|(n, _, _)| n == &name) {
                             Some(pos) => building.remove(pos).1.elapsed().as_secs_f32(),
                             None => 0.0,
                         };
@@ -107,7 +174,10 @@ fn main() -> Result<()> {
             Event::Error(msg) => errors.push(msg),
             Event::Done(ok) => {
                 build_ok = Some(ok);
-                grew_by = dir_size(&target_dir).saturating_sub(before_size);
+                grew_by = target_dir
+                    .as_deref()
+                    .map(|dir| dir_size(dir).saturating_sub(before_size))
+                    .unwrap_or(0);
             }
         });
 
@@ -187,18 +257,24 @@ fn main() -> Result<()> {
         let building_count = building.len().min(BUILDING_ROWS);
         for i in 0..BUILDING_ROWS {
             match building.get(i) {
-                Some((name, start)) => {
+                Some((name, start, running_script)) => {
                     let alpha = (i + 1) as f32 / building_count.max(1) as f32;
                     let name_fg = if name == &project {
                         rimel::palette::SAPPHIRE
                     } else {
                         rimel::palette::TEXT
                     };
+                    let version = versions.get(name).map(String::as_str).unwrap_or("");
+                    let label = if *running_script {
+                        format!("build({name}) {version}")
+                    } else {
+                        format!("{name} {version}")
+                    };
                     lines.push(fade(
                         rimel::row([
                             rimel::text("● ").fg(rimel::palette::YELLOW),
-                            rimel::text(format!("{name:<20}")).fg(name_fg),
-                            rimel::text(format!("{:.2}s", start.elapsed().as_secs_f32()))
+                            rimel::text(format!("{label:<NAME_WIDTH$}")).fg(name_fg),
+                            rimel::text(format!("{:05.2}s", start.elapsed().as_secs_f32()))
                                 .fg(rimel::palette::SUBTEXT0),
                         ]),
                         alpha,
@@ -218,11 +294,13 @@ fn main() -> Result<()> {
         }
         for (i, (name, secs)) in recent.into_iter().rev().enumerate() {
             let alpha = (i + 1) as f32 / recent_count.max(1) as f32;
+            let version = versions.get(name).map(String::as_str).unwrap_or("");
+            let label = format!("{name} {version}");
             lines.push(fade(
                 rimel::row([
                     rimel::text("✓ ").fg(rimel::palette::GREEN),
-                    rimel::text(format!("{name:<20}")).fg(rimel::palette::TEXT),
-                    rimel::text(format!("{secs:.2}s")).fg(rimel::palette::SUBTEXT0),
+                    rimel::text(format!("{label:<NAME_WIDTH$}")).fg(rimel::palette::TEXT),
+                    rimel::text(format!("{secs:05.2}s")).fg(rimel::palette::SUBTEXT0),
                 ]),
                 alpha,
             ));
@@ -240,7 +318,16 @@ fn main() -> Result<()> {
         ]));
 
         cx.render(rimel::col(lines));
-    })?;
+    });
+
+    match run {
+        Ok(()) => {}
+        // Ctrl+C: the run already left the terminal in a clean state, so there's nothing to
+        // report — exit quietly with the shell's usual SIGINT-style code instead of letting
+        // eyre print `Cancelled` as if it were a failure.
+        Err(e) if e.downcast_ref::<Cancelled>().is_some() => std::process::exit(130),
+        Err(e) => return Err(e),
+    }
 
     if build_ok == Some(false) {
         for err in &errors {
