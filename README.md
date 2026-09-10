@@ -18,8 +18,13 @@ guess.
 ## Install
 
 ```bash
-cargo install --git https://github.com/romancitodev/cargo-pretty
+cargo install cargo-pretty-build      # from crates.io
+cargo binstall cargo-pretty-build     # prebuilt, from GitHub releases
+cargo install --git https://github.com/romancitodev/cargo-pretty  # straight from source
 ```
+
+The crate is still called `cargo-pretty-build` (it was already published under that
+name), only the binary it installs is `cargo-pretty`.
 
 ## Usage
 
