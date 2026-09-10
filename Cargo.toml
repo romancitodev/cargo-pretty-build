@@ -1,10 +1,10 @@
 [package]
 name = "cargo-pretty"
-description = "A cargo wrapper with a live, animated status view for build/test/run/check"
+description = "A cargo wrapper with a live, animated status view for build, run and test"
 repository = "https://github.com/romancitodev/cargo-pretty-build"
 authors = ["romancitodev"]
 license = "MIT"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2024"
 
 [dependencies]
