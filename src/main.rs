@@ -574,11 +574,7 @@ fn main() -> Result<()> {
         let (name, _) = name.split_once('.').unwrap_or((&name, ""));
 
         println!("{}", "─".repeat(40).dim());
-        println!(
-            "{} {}",
-            " Executing".dim(),
-            format!("{name}").bold().underlined()
-        );
+        println!("{} {}", " Executing".dim(), name.bold().underlined());
         let status = std::process::Command::new(path)
             .args(program_args)
             .status()?;
