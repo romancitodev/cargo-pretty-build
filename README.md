@@ -13,7 +13,7 @@ guess.
 > `cargo pretty-build` for `cargo pretty build`. Bare `cargo pretty` still means build,
 > so most of your muscle memory survives.
 
-<video src="https://github.com/user-attachments/assets/3d2ed6bc-21c0-4800-bcea-35ded96518d2" controls></video>
+<video src="assets/cargo-pretty-itself.mp4" controls></video>
 
 ## Install
 
