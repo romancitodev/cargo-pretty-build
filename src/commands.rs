@@ -45,9 +45,7 @@ impl Verb {
                     args,
                 ))
             }
-            other => Err(format!(
-                "cargo pretty: `{other}` isn't supported yet (try build, run or test)"
-            )),
+            other => Err(toxic_reply(other)),
         }
     }
 
@@ -68,6 +66,28 @@ impl Verb {
             Verb::Test { .. } => &["test", "--no-run"],
         }
     }
+}
+
+/// An unsupported verb gets a bad-breakup line instead of a plain error message.
+fn toxic_reply(verb: &str) -> String {
+    let lines = [
+        format!("throw `{verb}` at the Go compiler, not at me."),
+        format!("oh, so now you want `{verb}`. where was `{verb}` when I needed you?"),
+        format!("don't come crying to me when `{verb}` doesn't work either."),
+        format!("wow. `{verb}`. after everything we've been through."),
+        format!("I saw the way you looked at `{verb}`. we need to talk."),
+        format!("fine. FINE. go run `{verb}` with someone else."),
+        format!("you always do this, you never even told me what `{verb}` means to you."),
+        format!("if `{verb}` mattered to you, you'd have told cargo about it first."),
+        format!("I'm not mad. I'm just disappointed you'd even try `{verb}` on me."),
+        format!("so this is what we're doing now? `{verb}`? really?"),
+    ];
+    // `subsec_nanos()` quantizes to the OS clock tick on Windows, which is coarse enough that
+    // `% 10` always landed on the same line. `RandomState`'s per-process seed isn't clock-based.
+    use std::collections::hash_map::RandomState;
+    use std::hash::{BuildHasher, Hasher};
+    let idx = (RandomState::new().build_hasher().finish() as usize) % lines.len();
+    format!("cargo pretty: {}", lines[idx])
 }
 
 /// Pulls the args after a trailing `--` out of `args`, leaving `args` holding only what came
