@@ -4,7 +4,7 @@ description = "A cargo wrapper with a live, animated status view for build, run 
 repository = "https://github.com/romancitodev/cargo-pretty"
 authors = ["romancitodev"]
 license = "MIT"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 
 # The crates.io package keeps its original name (already published under it); the binary
