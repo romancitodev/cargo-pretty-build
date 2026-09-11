@@ -11,6 +11,7 @@ use std::time::Instant;
 use cargo_metadata::MetadataCommand;
 use crossterm::event::KeyCode;
 use crossterm::style::Stylize;
+use crossterm::terminal;
 use eyre::Result;
 use nobubbles::app::{Cancelled, Inline};
 use nobubbles::effects;
@@ -31,6 +32,79 @@ const FAILED_ROWS: usize = 6;
 /// Writing this signal every frame is what keeps nobubbles' reactive loop ticking during the
 /// post-build settle animation. A plain local (Instant, bool) wouldn't request the next frame.
 const SETTLE_STEP: f32 = 0.125;
+/// Coarse jump size for PageUp/PageDown and for landing near the tail when a test is first
+/// expanded. Not the actual display cap: the render step sizes that to what the real terminal
+/// can show, so this only has to be a reasonable approximation for input handling.
+const STDOUT_PAGE: usize = 20;
+
+/// What's being built: identity, disk footprint, per-crate versions.
+#[derive(Default)]
+struct Project {
+    name: String,
+    target_dir: Option<PathBuf>,
+    before_size: u64,
+    versions: HashMap<String, String>,
+    compiled: HashSet<String>,
+    grew_by: u64,
+}
+
+/// The live progress bar / building-done lists.
+#[derive(Default)]
+struct Progress {
+    total: usize,
+    seen: usize,
+    // (crate or test name, started, running its build.rs right now? always false for tests)
+    building: Vec<(String, Instant, bool)>,
+    done: Vec<(String, f32)>,
+    // Flips once the compile phase hands off to running the compiled tests, at which point
+    // "Compiling"/"Compiled" become "Running"/"Tests" and the progress bar restarts at 0.
+    testing: bool,
+}
+
+/// The warning panel shown after a build with warnings settles.
+#[derive(Default)]
+struct Warnings {
+    items: Vec<Warning>,
+    selected: usize,
+    inspecting: bool,
+}
+
+/// The failed-test accordion: every failure stays listed, ↑↓/Enter pick and expand one.
+#[derive(Default)]
+struct FailedTests {
+    items: Vec<FailedTest>,
+    selected: usize,
+    expanded: Vec<bool>,
+    // How many lines of the selected test's stdout are scrolled past, so a panic's full
+    // output stays reachable via PageUp/PageDown instead of being clipped by the terminal.
+    stdout_scroll: usize,
+}
+
+/// Approximate scroll position that lands near the tail (usually where the panic message is).
+/// The render step re-clamps this to the terminal's actual available rows.
+fn tail_scroll(stdout: &str) -> usize {
+    stdout.lines().count().saturating_sub(STDOUT_PAGE)
+}
+
+/// Terminal rows currently available, or a sane guess when the query fails (e.g. not a tty).
+fn terminal_rows() -> usize {
+    terminal::size().map(|(_, rows)| rows).unwrap_or(24) as usize
+}
+
+/// Everything the render loop accumulates across frames.
+#[derive(Default)]
+struct State {
+    project: Project,
+    progress: Progress,
+    warnings: Warnings,
+    failed: FailedTests,
+    errors: Vec<String>,
+    build_ok: Option<bool>,
+    run_target: Option<PathBuf>,
+    // Frozen the instant `Done` fires, so the clock stops for real instead of ticking away
+    // while the user browses failed tests afterward.
+    final_elapsed: Option<f32>,
+}
 
 fn main() -> Result<()> {
     let mut extra_args: Vec<String> = std::env::args().skip(1).collect();
@@ -173,32 +247,7 @@ fn main() -> Result<()> {
     let started = Instant::now();
     let settle_t = signal(0.0f32);
     let dismissing = signal(false);
-    let mut project = String::new();
-    let mut target_dir: Option<PathBuf> = None;
-    let mut before_size = 0u64;
-    let mut total = 0usize;
-    let mut versions: HashMap<String, String> = HashMap::new();
-    let mut compiled: HashSet<String> = HashSet::new();
-    let mut seen = 0usize;
-    // (crate or test name, started, running its build.rs right now? always false for tests)
-    let mut building: Vec<(String, Instant, bool)> = Vec::new();
-    let mut done: Vec<(String, f32)> = Vec::new();
-    let mut failed: Vec<FailedTest> = Vec::new();
-    let mut warnings: Vec<Warning> = Vec::new();
-    let mut errors: Vec<String> = Vec::new();
-    let mut build_ok: Option<bool> = None;
-    let mut grew_by = 0u64;
-    let mut selected = 0usize;
-    let mut inspecting = false;
-    let mut failed_selected = 0usize;
-    let mut failed_expanded: Vec<bool> = Vec::new();
-    let mut run_target: Option<PathBuf> = None;
-    // Frozen the instant `Done` fires, so the clock stops for real instead of ticking away
-    // while the user browses failed tests afterward.
-    let mut final_elapsed: Option<f32> = None;
-    // Flips once the compile phase hands off to running the compiled tests, at which point
-    // "Compiling"/"Compiled" become "Running"/"Tests" and the progress bar restarts at 0.
-    let mut testing = false;
+    let mut s = State::default();
 
     let run = Inline::run(20, |cx| {
         inbox.drain(|event| match event {
@@ -208,26 +257,26 @@ fn main() -> Result<()> {
                 total: t,
                 versions: v,
             } => {
-                project = p;
-                before_size = dir_size(&dir);
-                target_dir = Some(dir);
-                total = t;
-                versions = v;
+                s.project.name = p;
+                s.project.before_size = dir_size(&dir);
+                s.project.target_dir = Some(dir);
+                s.progress.total = t;
+                s.project.versions = v;
             }
-            Event::Total(t) => total = t,
+            Event::Total(t) => s.progress.total = t,
             Event::Started(name) => {
-                if !building.iter().any(|(n, _, _)| n == &name) {
-                    building.push((name, Instant::now(), false));
+                if !s.progress.building.iter().any(|(n, _, _)| n == &name) {
+                    s.progress.building.push((name, Instant::now(), false));
                 }
             }
             Event::ScriptRunning(name) => {
-                if let Some(entry) = building.iter_mut().find(|(n, _, _)| n == &name) {
+                if let Some(entry) = s.progress.building.iter_mut().find(|(n, _, _)| n == &name) {
                     entry.2 = true;
                 }
             }
             Event::ScriptExecuted(name) => {
-                seen += 1;
-                if let Some(entry) = building.iter_mut().find(|(n, _, _)| n == &name) {
+                s.progress.seen += 1;
+                if let Some(entry) = s.progress.building.iter_mut().find(|(n, _, _)| n == &name) {
                     entry.2 = false;
                 }
             }
@@ -237,34 +286,35 @@ fn main() -> Result<()> {
                 fresh,
                 real,
             } => {
-                seen += 1;
+                s.progress.seen += 1;
                 if !fresh {
-                    compiled.insert(id);
+                    s.project.compiled.insert(id);
                     if real {
-                        let secs = match building.iter().position(|(n, _, _)| n == &name) {
-                            Some(pos) => building.remove(pos).1.elapsed().as_secs_f32(),
+                        let secs = match s.progress.building.iter().position(|(n, _, _)| n == &name)
+                        {
+                            Some(pos) => s.progress.building.remove(pos).1.elapsed().as_secs_f32(),
                             None => 0.0,
                         };
-                        done.push((name, secs));
+                        s.progress.done.push((name, secs));
                     }
                 }
             }
-            Event::Warning(w) => warnings.push(w),
-            Event::Error(msg) => errors.push(msg),
-            Event::Executables(paths) => run_target = paths.into_iter().next(),
+            Event::Warning(w) => s.warnings.items.push(w),
+            Event::Error(msg) => s.errors.push(msg),
+            Event::Executables(paths) => s.run_target = paths.into_iter().next(),
             Event::SuiteStarted { total: t } => {
-                if !testing {
-                    testing = true;
-                    seen = 0;
-                    total = 0;
-                    done.clear();
-                    building.clear();
+                if !s.progress.testing {
+                    s.progress.testing = true;
+                    s.progress.seen = 0;
+                    s.progress.total = 0;
+                    s.progress.done.clear();
+                    s.progress.building.clear();
                 }
-                total += t;
+                s.progress.total += t;
             }
             Event::TestStarted(name) => {
-                if !building.iter().any(|(n, _, _)| n == &name) {
-                    building.push((name, Instant::now(), false));
+                if !s.progress.building.iter().any(|(n, _, _)| n == &name) {
+                    s.progress.building.push((name, Instant::now(), false));
                 }
             }
             Event::TestFinished {
@@ -272,52 +322,56 @@ fn main() -> Result<()> {
                 secs,
                 outcome,
             } => {
-                seen += 1;
-                if let Some(pos) = building.iter().position(|(n, _, _)| n == &name) {
-                    building.remove(pos);
+                s.progress.seen += 1;
+                if let Some(pos) = s.progress.building.iter().position(|(n, _, _)| n == &name) {
+                    s.progress.building.remove(pos);
                 }
                 match outcome {
-                    Outcome::Passed => done.push((name, secs)),
+                    Outcome::Passed => s.progress.done.push((name, secs)),
                     Outcome::Ignored => {}
                     Outcome::Failed { location, stdout } => {
-                        failed.push(FailedTest {
+                        s.failed.items.push(FailedTest {
                             name,
                             secs,
                             location,
                             stdout,
                         });
-                        failed_expanded.push(false);
+                        s.failed.expanded.push(false);
                     }
                 }
             }
             Event::Done(ok) => {
-                build_ok = Some(ok);
-                final_elapsed = Some(started.elapsed().as_secs_f32());
-                grew_by = target_dir
+                s.build_ok = Some(ok);
+                s.final_elapsed = Some(started.elapsed().as_secs_f32());
+                s.project.grew_by = s
+                    .project
+                    .target_dir
                     .as_deref()
-                    .map(|dir| dir_size(dir).saturating_sub(before_size))
+                    .map(|dir| dir_size(dir).saturating_sub(s.project.before_size))
                     .unwrap_or(0);
             }
         });
 
         let is_test = matches!(verb, Verb::Test { .. });
-        let elapsed = final_elapsed.unwrap_or_else(|| started.elapsed().as_secs_f32());
+        let elapsed = s
+            .final_elapsed
+            .unwrap_or_else(|| started.elapsed().as_secs_f32());
 
         if dismissing.get() {
             cx.render(summary_block(
-                &project,
-                build_ok.unwrap_or(false),
+                &s.project.name,
+                s.build_ok.unwrap_or(false),
                 elapsed,
-                warnings.len(),
-                compiled.len(),
-                grew_by,
+                s.warnings.items.len(),
+                s.project.compiled.len(),
+                s.project.grew_by,
             ));
             quit();
             return;
         }
 
         let mut settled = false;
-        if build_ok.is_some() {
+        if s.build_ok.is_some() {
             let t = settle_t.update(|t| {
                 *t = (*t + SETTLE_STEP).min(1.0);
                 *t
@@ -328,18 +382,19 @@ fn main() -> Result<()> {
             // `test` instead falls through to the normal table below and keeps it on screen:
             // the last few tests run are exactly what you want to still see once it's done.
             if settled && !is_test {
-                if !warnings.is_empty() {
+                if !s.warnings.items.is_empty() {
                     if let Some(k) = cx.key() {
                         match k.code {
                             KeyCode::Up => {
-                                selected = selected.saturating_sub(1);
-                                inspecting = false;
+                                s.warnings.selected = s.warnings.selected.saturating_sub(1);
+                                s.warnings.inspecting = false;
                             }
                             KeyCode::Down => {
-                                selected = (selected + 1).min(warnings.len() - 1);
-                                inspecting = false;
+                                s.warnings.selected =
+                                    (s.warnings.selected + 1).min(s.warnings.items.len() - 1);
+                                s.warnings.inspecting = false;
                             }
-                            KeyCode::Enter => inspecting = !inspecting,
+                            KeyCode::Enter => s.warnings.inspecting = !s.warnings.inspecting,
                             KeyCode::Esc => {
                                 dismissing.set(true);
                                 cx.render(rimel::text(""));
@@ -348,48 +403,78 @@ fn main() -> Result<()> {
                             _ => {}
                         }
                     }
-                    cx.render(warning_panel(&warnings, selected, inspecting));
+                    cx.render(warning_panel(
+                        &s.warnings.items,
+                        s.warnings.selected,
+                        s.warnings.inspecting,
+                    ));
                     return;
                 }
 
                 cx.render(summary_block(
-                    &project,
-                    build_ok.unwrap_or(false),
+                    &s.project.name,
+                    s.build_ok.unwrap_or(false),
                     elapsed,
-                    warnings.len(),
-                    compiled.len(),
-                    grew_by,
+                    s.warnings.items.len(),
+                    s.project.compiled.len(),
+                    s.project.grew_by,
                 ));
                 quit();
                 return;
             }
         }
 
-        // Accordion over every failed test, not a one-at-a-time viewer: all rows stay visible,
-        // ↑↓ only move which row is highlighted, Enter expands/collapses that row in place.
+        // Accordion over every failed test, not a one-at-a-time viewer: all rows stay visible.
+        // While a row is collapsed, ↑↓ move which row is highlighted. Once Enter expands it,
+        // ↑↓ scroll its stdout instead (that's the content the arrows are on now); PageUp/Down
+        // always scroll regardless, and the render step is what actually clamps to the true
+        // end, so these never need to know the real max themselves.
         if is_test
             && settled
-            && !failed.is_empty()
+            && !s.failed.items.is_empty()
             && let Some(k) = cx.key()
         {
+            let expanded = s
+                .failed
+                .expanded
+                .get(s.failed.selected)
+                .copied()
+                .unwrap_or(false);
             match k.code {
-                KeyCode::Up => failed_selected = failed_selected.saturating_sub(1),
+                KeyCode::Up if expanded => {
+                    s.failed.stdout_scroll = s.failed.stdout_scroll.saturating_sub(1);
+                }
+                KeyCode::Down if expanded => {
+                    s.failed.stdout_scroll = s.failed.stdout_scroll.saturating_add(1);
+                }
+                KeyCode::Up => {
+                    s.failed.selected = s.failed.selected.saturating_sub(1);
+                    s.failed.stdout_scroll = tail_scroll(&s.failed.items[s.failed.selected].stdout);
+                }
                 KeyCode::Down => {
-                    failed_selected = (failed_selected + 1).min(failed.len() - 1);
+                    s.failed.selected = (s.failed.selected + 1).min(s.failed.items.len() - 1);
+                    s.failed.stdout_scroll = tail_scroll(&s.failed.items[s.failed.selected].stdout);
                 }
                 KeyCode::Enter => {
-                    if let Some(expanded) = failed_expanded.get_mut(failed_selected) {
+                    if let Some(expanded) = s.failed.expanded.get_mut(s.failed.selected) {
                         *expanded = !*expanded;
                     }
+                    s.failed.stdout_scroll = tail_scroll(&s.failed.items[s.failed.selected].stdout);
+                }
+                KeyCode::PageUp => {
+                    s.failed.stdout_scroll = s.failed.stdout_scroll.saturating_sub(STDOUT_PAGE);
+                }
+                KeyCode::PageDown => {
+                    s.failed.stdout_scroll = s.failed.stdout_scroll.saturating_add(STDOUT_PAGE);
                 }
                 KeyCode::Esc => quit(),
                 _ => {}
             }
         }
 
-        let ratio = (seen as f32 / total.max(1) as f32).min(1.0);
+        let ratio = (s.progress.seen as f32 / s.progress.total.max(1) as f32).min(1.0);
         let filled = (f32::from(BAR_WIDTH) * ratio).round() as u16;
-        let (live_label, done_label, bar_label) = if testing {
+        let (live_label, done_label, bar_label) = if s.progress.testing {
             ("Running", "Tests", "Progress")
         } else {
             ("Compiling", "Compiled", "Build")
@@ -403,23 +488,33 @@ fn main() -> Result<()> {
 
         // Fixed row counts so nothing below reflows as jobs start/finish; blank rows pad instead.
         // Older rows fade toward the background so the freshest entry stands out.
-        let building_count = building.len().min(BUILDING_ROWS);
+        let building_count = s.progress.building.len().min(BUILDING_ROWS);
         for i in 0..BUILDING_ROWS {
-            match building.get(i) {
+            match s.progress.building.get(i) {
                 Some((name, start, running_script)) => {
                     let alpha = (i + 1) as f32 / building_count.max(1) as f32;
-                    let name_fg = if name == &project {
+                    let name_fg = if name == &s.project.name {
                         rimel::palette::SAPPHIRE
                     } else {
                         rimel::palette::TEXT
                     };
-                    let label = if testing {
+                    let label = if s.progress.testing {
                         name.clone()
                     } else if *running_script {
-                        let version = versions.get(name).map(String::as_str).unwrap_or("");
+                        let version = s
+                            .project
+                            .versions
+                            .get(name)
+                            .map(String::as_str)
+                            .unwrap_or("");
                         format!("build({name}) {version}")
                     } else {
-                        let version = versions.get(name).map(String::as_str).unwrap_or("");
+                        let version = s
+                            .project
+                            .versions
+                            .get(name)
+                            .map(String::as_str)
+                            .unwrap_or("");
                         format!("{name} {version}")
                     };
                     lines.push(fade(
@@ -432,24 +527,37 @@ fn main() -> Result<()> {
                         alpha,
                     ))
                 }
-                None if i == 0 && building.is_empty() => lines.push(rimel::text("  …").dim()),
+                None if i == 0 && s.progress.building.is_empty() => {
+                    lines.push(rimel::text("  …").dim())
+                }
                 None => lines.push(rimel::text("")),
             }
         }
 
         lines.push(rimel::separator(40).dim());
-        lines.push(rimel::text(format!("{done_label} ({seen}/{total})")).dim());
-        let recent: Vec<&(String, f32)> = done.iter().rev().take(DONE_ROWS).collect();
+        lines.push(
+            rimel::text(format!(
+                "{done_label} ({}/{})",
+                s.progress.seen, s.progress.total
+            ))
+            .dim(),
+        );
+        let recent: Vec<&(String, f32)> = s.progress.done.iter().rev().take(DONE_ROWS).collect();
         let recent_count = recent.len();
         for _ in 0..DONE_ROWS - recent.len() {
             lines.push(rimel::text(""));
         }
         for (i, (name, secs)) in recent.into_iter().rev().enumerate() {
             let alpha = (i + 1) as f32 / recent_count.max(1) as f32;
-            let label = if testing {
+            let label = if s.progress.testing {
                 name.clone()
             } else {
-                let version = versions.get(name).map(String::as_str).unwrap_or("");
+                let version = s
+                    .project
+                    .versions
+                    .get(name)
+                    .map(String::as_str)
+                    .unwrap_or("");
                 format!("{name} {version}")
             };
             lines.push(fade(
@@ -464,7 +572,7 @@ fn main() -> Result<()> {
         // The gradient sweep is a "still working" cue. Once settled, nothing is, so the bar
         // gets a plain outcome color instead of an animation that would keep drifting forever.
         let filled_bar = if settled {
-            let color = if failed.is_empty() {
+            let color = if s.failed.items.is_empty() {
                 rimel::palette::GREEN
             } else {
                 rimel::palette::RED
@@ -488,38 +596,48 @@ fn main() -> Result<()> {
         // Accordion: every failed test is always a row here, `settled` just turns on the
         // ↑↓ / Enter navigation above. Before that it's still shown, just not selectable yet,
         // so a failure is visible the instant it happens instead of hiding behind the run.
-        if !failed.is_empty() {
+        if !s.failed.items.is_empty() {
             let header = if settled {
-                format!("Failed ({}/{})", failed_selected + 1, failed.len())
+                format!(
+                    "Failed ({}/{})",
+                    s.failed.selected + 1,
+                    s.failed.items.len()
+                )
             } else {
-                format!("Failed ({})", failed.len())
+                format!("Failed ({})", s.failed.items.len())
             };
             lines.push(rimel::text(""));
             lines.push(rimel::text(header).fg(rimel::palette::RED).bold());
             if settled {
                 lines.push(rimel::text(""));
-                lines.push(rimel::text("↑↓ select   Enter expand/collapse").dim());
+                lines.push(
+                    rimel::text(
+                        "↑↓ select / scroll when expanded   Enter expand/collapse   PgUp/PgDn page",
+                    )
+                    .dim(),
+                );
             }
             // Scrolls to keep the selected row in view instead of dumping every failure on
             // screen at once, which is unreadable once there are more than a handful.
-            let window_start = if failed.len() > FAILED_ROWS {
-                failed_selected
+            let window_start = if s.failed.items.len() > FAILED_ROWS {
+                s.failed
+                    .selected
                     .saturating_sub(FAILED_ROWS - 1)
-                    .min(failed.len() - FAILED_ROWS)
+                    .min(s.failed.items.len() - FAILED_ROWS)
             } else {
                 0
             };
-            let window_end = (window_start + FAILED_ROWS).min(failed.len());
-            let window = failed[window_start..window_end]
+            let window_end = (window_start + FAILED_ROWS).min(s.failed.items.len());
+            let window = s.failed.items[window_start..window_end]
                 .iter()
                 .enumerate()
                 .map(|(j, f)| (window_start + j, f));
             for (i, f) in window {
-                let expanded = failed_expanded.get(i).copied().unwrap_or(false);
+                let expanded = s.failed.expanded.get(i).copied().unwrap_or(false);
                 let marker = if expanded { "▾ " } else { "▸ " };
                 let name =
                     rimel::text(format!("{:<NAME_WIDTH$} ", f.name)).fg(rimel::palette::TEXT);
-                let name = if settled && i == failed_selected {
+                let name = if settled && i == s.failed.selected {
                     name.bold().fg(Color::LightRed)
                 } else {
                     name
@@ -533,13 +651,34 @@ fn main() -> Result<()> {
                     if let Some(loc) = &f.location {
                         lines.push(rimel::text(format!("  at {loc}")).dim());
                     }
-                    lines.push(rimel::text(format!("  {}", f.stdout.clone())));
+                    // Unbounded stdout can grow the view taller than the terminal, which
+                    // ratatui's inline viewport then silently clips instead of scrolling. Sizing
+                    // the window to what's actually left on screen shows the whole thing
+                    // whenever it fits (the common case), only scrolling when it truly can't.
+                    let stdout_lines: Vec<&str> = f.stdout.lines().collect();
+                    let budget = terminal_rows()
+                        .saturating_sub(lines.len())
+                        .saturating_sub(2)
+                        .max(3);
+                    let max_scroll = stdout_lines.len().saturating_sub(budget);
+                    let scroll = s.failed.stdout_scroll.min(max_scroll);
+                    let end = (scroll + budget).min(stdout_lines.len());
+                    if scroll > 0 {
+                        lines.push(rimel::text(format!("  ↑ {scroll} more lines (PageUp)")).dim());
+                    }
+                    for line in &stdout_lines[scroll..end] {
+                        lines.push(rimel::text(format!("  {line}")));
+                    }
+                    let below = stdout_lines.len() - end;
+                    if below > 0 {
+                        lines.push(rimel::text(format!("  ↓ {below} more lines (PageDown)")).dim());
+                    }
                 }
             }
         }
 
         cx.render(rimel::col(lines));
-        if is_test && settled && failed.is_empty() {
+        if is_test && settled && s.failed.items.is_empty() {
             quit();
         }
     });
@@ -553,8 +692,8 @@ fn main() -> Result<()> {
         Err(e) => return Err(e),
     }
 
-    if build_ok == Some(false) {
-        for err in &errors {
+    if s.build_ok == Some(false) {
+        for err in &s.errors {
             eprint!("{err}");
         }
         std::process::exit(1);
@@ -563,7 +702,7 @@ fn main() -> Result<()> {
     // The TUI has already handed the terminal back at this point, so the child inherits it
     // cleanly instead of racing the animated view for the same screen region.
     if let Verb::Run { program_args } = verb {
-        let Some(path) = run_target else {
+        let Some(path) = s.run_target else {
             eprintln!("cargo pretty: build succeeded but no runnable target was found");
             std::process::exit(1);
         };
