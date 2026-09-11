@@ -462,7 +462,7 @@ fn main() -> Result<()> {
                                 s.warnings.inspecting = false;
                             }
                             KeyCode::Enter => s.warnings.inspecting = !s.warnings.inspecting,
-                            KeyCode::Esc => {
+                            KeyCode::Esc | KeyCode::Char('q') => {
                                 dismissing.set(true);
                                 cx.render(rimel::text(""));
                                 return;
@@ -534,7 +534,7 @@ fn main() -> Result<()> {
                 KeyCode::PageDown => {
                     s.failed.stdout_scroll = s.failed.stdout_scroll.saturating_add(STDOUT_PAGE);
                 }
-                KeyCode::Esc => quit(),
+                KeyCode::Esc | KeyCode::Char('q') => quit(),
                 _ => {}
             }
         }
@@ -679,7 +679,7 @@ fn main() -> Result<()> {
                 lines.push(rimel::text(""));
                 lines.push(
                     rimel::text(
-                        "↑↓ select / scroll when expanded   Enter expand/collapse   PgUp/PgDn page",
+                        "↑↓ select / scroll when expanded   Enter expand/collapse   PgUp/PgDn page   Esc/q quit",
                     )
                     .dim(),
                 );
@@ -737,8 +737,12 @@ fn main() -> Result<()> {
                         .saturating_sub(lines.len())
                         .saturating_sub(2)
                         .max(3);
+                    // Written back, not just read: without this, holding Down past the bottom
+                    // keeps incrementing stdout_scroll past what's ever shown, and Up then has
+                    // to burn through that overshoot before the view visibly moves again.
                     let max_scroll = stdout_lines.len().saturating_sub(budget);
-                    let scroll = s.failed.stdout_scroll.min(max_scroll);
+                    s.failed.stdout_scroll = s.failed.stdout_scroll.min(max_scroll);
+                    let scroll = s.failed.stdout_scroll;
                     let end = (scroll + budget).min(stdout_lines.len());
                     if scroll > 0 {
                         lines.push(rimel::text(format!("  ↑ {scroll} more lines (PageUp)")).dim());

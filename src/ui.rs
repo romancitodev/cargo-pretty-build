@@ -62,7 +62,7 @@ pub fn warning_panel(warnings: &[Warning], selected: usize, inspecting: bool) ->
         rimel::text(""),
         boxed,
         rimel::text(""),
-        rimel::text("↑↓ navigate   Enter inspect   Esc dismiss").dim(),
+        rimel::text("↑↓ navigate   Enter inspect   Esc/q dismiss").dim(),
     ])
 }
 
