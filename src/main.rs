@@ -47,6 +47,9 @@ struct Project {
     target_dir: Option<PathBuf>,
     before_size: u64,
     versions: HashMap<String, String>,
+    // Package id to crate name, from `cargo metadata`. Kept around so a retry can rebuild
+    // without re-running `cargo metadata` just to resolve artifact names again.
+    names: HashMap<String, String>,
     compiled: HashSet<String>,
     grew_by: u64,
 }
@@ -81,6 +84,9 @@ struct FailedTests {
     // How many lines of the selected test's stdout are scrolled past, so a panic's full
     // output stays reachable via PageUp/PageDown instead of being clipped by the terminal.
     stdout_scroll: usize,
+    // Name of the test currently being retried, if any. One at a time: `r` is a no-op while
+    // this is set.
+    retrying: Option<String>,
 }
 
 /// Approximate scroll position that lands near the tail (usually where the panic message is).
@@ -140,7 +146,9 @@ fn classify_stdout(stdout: &str) -> Vec<(StdoutStyle, &str)> {
         if !line.contains("panicked at ") {
             continue;
         }
-        let Some(message) = lines.next() else { continue };
+        let Some(message) = lines.next() else {
+            continue;
+        };
         out.push((StdoutStyle::Message, message));
         if let Some(left) = lines.peek().copied()
             && left.starts_with("  left: ")
@@ -282,6 +290,7 @@ fn main() -> Result<()> {
             target_dir,
             total,
             versions,
+            names: names.clone(),
         });
 
         // A more exact count needs its own `cargo` invocation, so it runs alongside the real
@@ -295,7 +304,8 @@ fn main() -> Result<()> {
             }
         });
 
-        let (ok, executables) = build(&tx, &names, setup_verb.compile_args(), &setup_args);
+        let (ok, executables, _errors) =
+            build(Some(&tx), &names, setup_verb.compile_args(), &setup_args);
         match setup_verb {
             Verb::Run { .. } => {
                 if ok {
@@ -323,12 +333,14 @@ fn main() -> Result<()> {
                 target_dir: dir,
                 total: t,
                 versions: v,
+                names: n,
             } => {
                 s.project.name = p;
                 s.project.before_size = dir_size(&dir);
                 s.project.target_dir = Some(dir);
                 s.progress.total = t;
                 s.project.versions = v;
+                s.project.names = n;
             }
             Event::Total(t) => s.progress.total = t,
             Event::Started(name) => {
@@ -404,6 +416,36 @@ fn main() -> Result<()> {
                             stdout,
                         });
                         s.failed.expanded.push(false);
+                    }
+                }
+            }
+            Event::RetryFinished {
+                name,
+                secs,
+                outcome,
+            } => {
+                s.failed.retrying = None;
+                if let Some(idx) = s.failed.items.iter().position(|f| f.name == name) {
+                    match outcome {
+                        Outcome::Passed | Outcome::Ignored => {
+                            s.failed.items.remove(idx);
+                            s.failed.expanded.remove(idx);
+                            s.failed.selected = s
+                                .failed
+                                .selected
+                                .min(s.failed.items.len().saturating_sub(1));
+                        }
+                        Outcome::Failed { location, stdout } => {
+                            s.failed.items[idx].secs = secs;
+                            s.failed.items[idx].location = location;
+                            s.failed.items[idx].stdout = stdout;
+                            if let Some(expanded) = s.failed.expanded.get_mut(idx) {
+                                *expanded = true;
+                            }
+                            if idx == s.failed.selected {
+                                s.failed.stdout_scroll = tail_scroll(&s.failed.items[idx].stdout);
+                            }
+                        }
                     }
                 }
             }
@@ -533,6 +575,20 @@ fn main() -> Result<()> {
                 }
                 KeyCode::PageDown => {
                     s.failed.stdout_scroll = s.failed.stdout_scroll.saturating_add(STDOUT_PAGE);
+                }
+                KeyCode::Char('r') if s.failed.retrying.is_none() => {
+                    let name = s.failed.items[s.failed.selected].name.clone();
+                    let names = s.project.names.clone();
+                    let extra_args = extra_args.clone();
+                    s.failed.retrying = Some(name.clone());
+                    inbox.spawn(move |tx| {
+                        let (secs, outcome) = test::retry(&names, &extra_args, &name);
+                        tx.send(Event::RetryFinished {
+                            name,
+                            secs,
+                            outcome,
+                        });
+                    });
                 }
                 KeyCode::Esc | KeyCode::Char('q') => quit(),
                 _ => {}
@@ -679,7 +735,7 @@ fn main() -> Result<()> {
                 lines.push(rimel::text(""));
                 lines.push(
                     rimel::text(
-                        "↑↓ select / scroll when expanded   Enter expand/collapse   PgUp/PgDn page   Esc/q quit",
+                        "↑↓ select / scroll when expanded   Enter expand/collapse   PgUp/PgDn page   r retry   Esc/q quit",
                     )
                     .dim(),
                 );
@@ -701,7 +757,12 @@ fn main() -> Result<()> {
                 .map(|(j, f)| (window_start + j, f));
             for (i, f) in window {
                 let expanded = s.failed.expanded.get(i).copied().unwrap_or(false);
-                let marker = if expanded { "▾ " } else { "▸ " };
+                let retrying = s.failed.retrying.as_deref() == Some(f.name.as_str());
+                let marker = if retrying {
+                    rimel::text("▲ ").fg(rimel::palette::YELLOW)
+                } else {
+                    rimel::text(if expanded { "▾ " } else { "▸ " }).fg(rimel::palette::RED)
+                };
                 let name =
                     rimel::text(format!("{:<NAME_WIDTH$} ", f.name)).fg(rimel::palette::TEXT);
                 let name = if settled && i == s.failed.selected {
@@ -709,11 +770,12 @@ fn main() -> Result<()> {
                 } else {
                     name
                 };
-                lines.push(rimel::row([
-                    rimel::text(marker).fg(rimel::palette::RED),
-                    name,
-                    rimel::text(format!("{:05.2}s", f.secs)).fg(rimel::palette::SUBTEXT0),
-                ]));
+                let secs = if retrying {
+                    rimel::text("retrying...").fg(rimel::palette::YELLOW)
+                } else {
+                    rimel::text(format!("{:05.2}s", f.secs)).fg(rimel::palette::SUBTEXT0)
+                };
+                lines.push(rimel::row([marker, name, secs]));
                 if expanded {
                     if let Some(loc) = &f.location {
                         lines.push(rimel::text(format!("  at {loc}")).dim());
@@ -829,10 +891,7 @@ mod tests {
         assert_eq!(
             classify_stdout(stdout),
             vec![
-                (
-                    StdoutStyle::Plain,
-                    "thread 'x' panicked at src/lib.rs:1:1:"
-                ),
+                (StdoutStyle::Plain, "thread 'x' panicked at src/lib.rs:1:1:"),
                 (StdoutStyle::Message, "assertion `left == right` failed"),
                 (StdoutStyle::Left, "  left: `1`"),
                 (StdoutStyle::Right, " right: `2`"),
@@ -848,10 +907,7 @@ mod tests {
         assert_eq!(
             classify_stdout(stdout),
             vec![
-                (
-                    StdoutStyle::Plain,
-                    "thread 'x' panicked at src/lib.rs:1:1:"
-                ),
+                (StdoutStyle::Plain, "thread 'x' panicked at src/lib.rs:1:1:"),
                 (
                     StdoutStyle::Message,
                     "called `Option::unwrap()` on a `None` value"
