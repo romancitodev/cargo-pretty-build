@@ -51,6 +51,10 @@ harness (`--no-fail-fast`, a name filter, whatever you need).
   run ends: `↑↓` to pick one, `Enter` to see the panic
 - ✅ A short summary on exit: time elapsed, libs compiled or tests passed, disk used
 - 💌 Feed it a verb it doesn't know and it takes it personally
+- 
+## Star History
+
+[![Star History Chart](https://api.star-history.com/chart?repos=romancitodev/cargo-pretty&type=date&logscale&legend=top-left)](https://www.star-history.com/?repos=romancitodev%2Fcargo-pretty&type=date&logscale=&legend=top-left)
 
 ## Built on
 
