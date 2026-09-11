@@ -99,10 +99,8 @@ fn terminal_cols() -> usize {
     terminal::size().map(|(cols, _)| cols).unwrap_or(80) as usize
 }
 
-/// Hard-wraps `line` to `width` chars so nothing scrolls off past the terminal edge instead of
-/// being silently clipped by ratatui's buffer (norimel cuts, it doesn't wrap — see its own doc
-/// comment). ponytail: single-width char count, not display width; wide/CJK glyphs would wrap
-/// early. Fine for the plain-ASCII Debug output this feeds today.
+/// Hard-wraps `line` to `width` chars. norimel clips instead of wrapping, so this has to.
+/// ponytail: char count, not display width. Fine for ASCII debug output.
 fn wrap_line(line: &str, width: usize) -> Vec<&str> {
     if width == 0 {
         return vec![line];
@@ -119,6 +117,44 @@ fn wrap_line(line: &str, width: usize) -> Vec<&str> {
         count += 1;
     }
     out.push(&line[start..]);
+    out
+}
+
+/// How a stdout line should stand out. Panic message and assert diff get styled, the rest
+/// stays `Plain`.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum StdoutStyle {
+    Plain,
+    Message,
+    Left,
+    Right,
+}
+
+/// Tags the line after `panicked at ...:` as the message, and libtest's `  left: `/` right: `
+/// pair after it, when present, as the diff.
+fn classify_stdout(stdout: &str) -> Vec<(StdoutStyle, &str)> {
+    let mut out = Vec::new();
+    let mut lines = stdout.lines().peekable();
+    while let Some(line) = lines.next() {
+        out.push((StdoutStyle::Plain, line));
+        if !line.contains("panicked at ") {
+            continue;
+        }
+        let Some(message) = lines.next() else { continue };
+        out.push((StdoutStyle::Message, message));
+        if let Some(left) = lines.peek().copied()
+            && left.starts_with("  left: ")
+        {
+            out.push((StdoutStyle::Left, left));
+            lines.next();
+            if let Some(right) = lines.peek().copied()
+                && right.starts_with(" right: ")
+            {
+                out.push((StdoutStyle::Right, right));
+                lines.next();
+            }
+        }
+    }
     out
 }
 
@@ -689,10 +725,13 @@ fn main() -> Result<()> {
                     let indent_width = terminal_cols()
                         .saturating_sub(2 + STDOUT_RIGHT_PADDING)
                         .max(1);
-                    let stdout_lines: Vec<&str> = f
-                        .stdout
-                        .lines()
-                        .flat_map(|line| wrap_line(line, indent_width))
+                    let stdout_lines: Vec<(StdoutStyle, &str)> = classify_stdout(&f.stdout)
+                        .into_iter()
+                        .flat_map(|(style, line)| {
+                            wrap_line(line, indent_width)
+                                .into_iter()
+                                .map(move |chunk| (style, chunk))
+                        })
                         .collect();
                     let budget = terminal_rows()
                         .saturating_sub(lines.len())
@@ -704,8 +743,14 @@ fn main() -> Result<()> {
                     if scroll > 0 {
                         lines.push(rimel::text(format!("  ↑ {scroll} more lines (PageUp)")).dim());
                     }
-                    for line in &stdout_lines[scroll..end] {
-                        lines.push(rimel::text(format!("  {line}")));
+                    for (style, line) in &stdout_lines[scroll..end] {
+                        let text = rimel::text(format!("  {line}"));
+                        lines.push(match style {
+                            StdoutStyle::Plain => text,
+                            StdoutStyle::Message => text.bold(),
+                            StdoutStyle::Left => text.fg(rimel::palette::RED),
+                            StdoutStyle::Right => text.fg(rimel::palette::GREEN),
+                        });
                     }
                     let below = stdout_lines.len() - end;
                     if below > 0 {
@@ -763,12 +808,51 @@ fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::wrap_line;
+    use super::{StdoutStyle, classify_stdout, wrap_line};
 
     #[test]
     fn wraps_long_lines_and_leaves_short_ones_alone() {
         assert_eq!(wrap_line("short", 10), vec!["short"]);
         assert_eq!(wrap_line("abcdefghij", 4), vec!["abcd", "efgh", "ij"]);
         assert_eq!(wrap_line("", 4), vec![""]);
+    }
+
+    #[test]
+    fn classifies_the_panic_message_and_assert_eq_diff() {
+        let stdout = "thread 'x' panicked at src/lib.rs:1:1:\n\
+            assertion `left == right` failed\n  left: `1`\n right: `2`\n\
+            note: run with `RUST_BACKTRACE=1`";
+        assert_eq!(
+            classify_stdout(stdout),
+            vec![
+                (
+                    StdoutStyle::Plain,
+                    "thread 'x' panicked at src/lib.rs:1:1:"
+                ),
+                (StdoutStyle::Message, "assertion `left == right` failed"),
+                (StdoutStyle::Left, "  left: `1`"),
+                (StdoutStyle::Right, " right: `2`"),
+                (StdoutStyle::Plain, "note: run with `RUST_BACKTRACE=1`"),
+            ]
+        );
+    }
+
+    #[test]
+    fn leaves_a_plain_panic_message_uncolored_without_a_diff() {
+        let stdout = "thread 'x' panicked at src/lib.rs:1:1:\n\
+                       called `Option::unwrap()` on a `None` value";
+        assert_eq!(
+            classify_stdout(stdout),
+            vec![
+                (
+                    StdoutStyle::Plain,
+                    "thread 'x' panicked at src/lib.rs:1:1:"
+                ),
+                (
+                    StdoutStyle::Message,
+                    "called `Option::unwrap()` on a `None` value"
+                ),
+            ]
+        );
     }
 }
