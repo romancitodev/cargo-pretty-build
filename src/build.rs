@@ -44,6 +44,9 @@ pub enum Event {
         target_dir: std::path::PathBuf,
         total: usize,
         versions: HashMap<String, String>,
+        /// Package id to crate name, kept around so a later retry can rebuild without paying
+        /// for another `cargo metadata` call just to resolve artifact names again.
+        names: HashMap<String, String>,
     },
     /// A more exact unit count than `Ready`'s, from cargo's own unit graph. Arrives later
     /// because it costs its own `cargo` invocation, run only after the real build is under way.
@@ -72,6 +75,12 @@ pub enum Event {
     },
     TestStarted(String),
     TestFinished {
+        name: String,
+        secs: f32,
+        outcome: Outcome,
+    },
+    /// A single failed test's `r`-triggered rerun came back.
+    RetryFinished {
         name: String,
         secs: f32,
         outcome: Outcome,
@@ -114,16 +123,18 @@ fn to_warning(d: &Diagnostic) -> Warning {
     }
 }
 
-/// Compiles with `cargo <cargo_args> --message-format=json <extra_args>` and streams progress
-/// as [`Event`]s. Returns whether it succeeded and every runnable artifact it produced (bins,
-/// examples, test binaries), in the order cargo built them. The caller decides what to do with
-/// those (`run` executes the one it found, `test` runs every one of them itself).
+/// Compiles with `cargo <cargo_args> --message-format=json <extra_args>` and, when `tx` is
+/// `Some`, streams progress as [`Event`]s. `None` is the quiet path a retry rebuilds with: no
+/// progress events, since that would reanimate the build/progress block above an accordion the
+/// user is mid-browse in. Either way, returns whether it succeeded, every runnable artifact it
+/// produced (bins, examples, test binaries) in build order, and the compiler's error text (empty
+/// on success).
 pub fn build(
-    tx: &Emitter<Event>,
+    tx: Option<&Emitter<Event>>,
     names: &HashMap<String, String>,
     cargo_args: &[&str],
     extra_args: &[String],
-) -> (bool, Vec<PathBuf>) {
+) -> (bool, Vec<PathBuf>, String) {
     let mut child = Command::new("cargo")
         .args(cargo_args)
         .args(["--message-format=json", "--color=always"])
@@ -136,7 +147,7 @@ pub fn build(
     // cargo writes "Compiling"/"Finished" straight to stderr regardless of --message-format;
     // it's the only place we learn a crate *started*, so a second thread parses it for that.
     let stderr = child.stderr.take().unwrap();
-    let stderr_tx = tx.clone();
+    let stderr_tx = tx.cloned();
     let stderr_thread = std::thread::spawn(move || {
         let mut full = String::new();
         for line in BufReader::new(stderr)
@@ -146,6 +157,7 @@ pub fn build(
             let clean = strip_ansi(&line);
             if let Some(rest) = clean.trim_start().strip_prefix("Compiling ")
                 && let Some(name) = rest.split_whitespace().next()
+                && let Some(stderr_tx) = &stderr_tx
             {
                 stderr_tx.send(Event::Started(name.to_string()));
             }
@@ -158,6 +170,7 @@ pub fn build(
     let reader = BufReader::new(child.stdout.take().unwrap());
     let mut ok = true;
     let mut executables = Vec::new();
+    let mut errors = String::new();
 
     for message in Message::parse_stream(reader).flatten() {
         match message {
@@ -166,39 +179,50 @@ pub fn build(
                 if let Some(path) = artifact.executable {
                     executables.push(path.into_std_path_buf());
                 }
-                let is_build_script = artifact
-                    .target
-                    .is_kind(cargo_metadata::TargetKind::CustomBuild);
-                let real = !is_build_script;
-                let id = artifact.package_id.repr.clone();
-                let name = names
-                    .get(id.as_str())
-                    .cloned()
-                    .unwrap_or(artifact.target.name);
-                if is_build_script && !fresh {
-                    tx.send(Event::ScriptRunning(name.clone()));
+                if let Some(tx) = tx {
+                    let is_build_script = artifact
+                        .target
+                        .is_kind(cargo_metadata::TargetKind::CustomBuild);
+                    let real = !is_build_script;
+                    let id = artifact.package_id.repr.clone();
+                    let name = names
+                        .get(id.as_str())
+                        .cloned()
+                        .unwrap_or(artifact.target.name);
+                    if is_build_script && !fresh {
+                        tx.send(Event::ScriptRunning(name.clone()));
+                    }
+                    tx.send(Event::Artifact {
+                        id,
+                        name,
+                        fresh,
+                        real,
+                    });
                 }
-                tx.send(Event::Artifact {
-                    id,
-                    name,
-                    fresh,
-                    real,
-                });
             }
             Message::BuildScriptExecuted(script) => {
-                let name = names
-                    .get(script.package_id.repr.as_str())
-                    .cloned()
-                    .unwrap_or(script.package_id.repr);
-                tx.send(Event::ScriptExecuted(name));
+                if let Some(tx) = tx {
+                    let name = names
+                        .get(script.package_id.repr.as_str())
+                        .cloned()
+                        .unwrap_or(script.package_id.repr);
+                    tx.send(Event::ScriptExecuted(name));
+                }
             }
             Message::CompilerMessage(msg) => match msg.message.level {
                 DiagnosticLevel::Error => {
                     if let Some(rendered) = msg.message.rendered {
-                        tx.send(Event::Error(rendered));
+                        if let Some(tx) = tx {
+                            tx.send(Event::Error(rendered.clone()));
+                        }
+                        errors.push_str(&rendered);
                     }
                 }
-                DiagnosticLevel::Warning => tx.send(Event::Warning(to_warning(&msg.message))),
+                DiagnosticLevel::Warning => {
+                    if let Some(tx) = tx {
+                        tx.send(Event::Warning(to_warning(&msg.message)));
+                    }
+                }
                 _ => {}
             },
             Message::BuildFinished(finished) => ok = finished.success,
@@ -209,7 +233,10 @@ pub fn build(
     let _ = child.wait();
     let stderr_text = stderr_thread.join().unwrap_or_default();
     if !ok && !stderr_text.trim().is_empty() {
-        tx.send(Event::Error(stderr_text));
+        if let Some(tx) = tx {
+            tx.send(Event::Error(stderr_text.clone()));
+        }
+        errors.push_str(&stderr_text);
     }
-    (ok, executables)
+    (ok, executables, errors)
 }
