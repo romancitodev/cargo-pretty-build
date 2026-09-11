@@ -36,6 +36,9 @@ const SETTLE_STEP: f32 = 0.125;
 /// expanded. Not the actual display cap: the render step sizes that to what the real terminal
 /// can show, so this only has to be a reasonable approximation for input handling.
 const STDOUT_PAGE: usize = 20;
+/// Right-hand breathing room for wrapped stdout lines, so captured output stops just short of
+/// the terminal edge instead of spanning the full width.
+const STDOUT_RIGHT_PADDING: usize = 4;
 
 /// What's being built: identity, disk footprint, per-crate versions.
 #[derive(Default)]
@@ -89,6 +92,34 @@ fn tail_scroll(stdout: &str) -> usize {
 /// Terminal rows currently available, or a sane guess when the query fails (e.g. not a tty).
 fn terminal_rows() -> usize {
     terminal::size().map(|(_, rows)| rows).unwrap_or(24) as usize
+}
+
+/// Terminal columns currently available, or a sane guess when the query fails (e.g. not a tty).
+fn terminal_cols() -> usize {
+    terminal::size().map(|(cols, _)| cols).unwrap_or(80) as usize
+}
+
+/// Hard-wraps `line` to `width` chars so nothing scrolls off past the terminal edge instead of
+/// being silently clipped by ratatui's buffer (norimel cuts, it doesn't wrap — see its own doc
+/// comment). ponytail: single-width char count, not display width; wide/CJK glyphs would wrap
+/// early. Fine for the plain-ASCII Debug output this feeds today.
+fn wrap_line(line: &str, width: usize) -> Vec<&str> {
+    if width == 0 {
+        return vec![line];
+    }
+    let mut out = Vec::new();
+    let mut start = 0;
+    let mut count = 0;
+    for (i, _) in line.char_indices() {
+        if count == width {
+            out.push(&line[start..i]);
+            start = i;
+            count = 0;
+        }
+        count += 1;
+    }
+    out.push(&line[start..]);
+    out
 }
 
 /// Everything the render loop accumulates across frames.
@@ -655,7 +686,14 @@ fn main() -> Result<()> {
                     // ratatui's inline viewport then silently clips instead of scrolling. Sizing
                     // the window to what's actually left on screen shows the whole thing
                     // whenever it fits (the common case), only scrolling when it truly can't.
-                    let stdout_lines: Vec<&str> = f.stdout.lines().collect();
+                    let indent_width = terminal_cols()
+                        .saturating_sub(2 + STDOUT_RIGHT_PADDING)
+                        .max(1);
+                    let stdout_lines: Vec<&str> = f
+                        .stdout
+                        .lines()
+                        .flat_map(|line| wrap_line(line, indent_width))
+                        .collect();
                     let budget = terminal_rows()
                         .saturating_sub(lines.len())
                         .saturating_sub(2)
@@ -721,4 +759,16 @@ fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::wrap_line;
+
+    #[test]
+    fn wraps_long_lines_and_leaves_short_ones_alone() {
+        assert_eq!(wrap_line("short", 10), vec!["short"]);
+        assert_eq!(wrap_line("abcdefghij", 4), vec!["abcd", "efgh", "ij"]);
+        assert_eq!(wrap_line("", 4), vec![""]);
+    }
 }
