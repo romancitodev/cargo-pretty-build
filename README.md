@@ -4,7 +4,7 @@
 ![license](https://img.shields.io/badge/license-MIT-blue.svg)
 
 <p align="center">
-  <img src="/assets/building.gif" alt="demo">
+  <img src="/assets/building.gif" alt="demo" width="800">
 </p>
 
 Cargo's own build output does the job. This does it prettier: a live status view for
@@ -18,7 +18,7 @@ guess.
 > so most of your muscle memory survives.
 
 <p align="center">
-  <video src="assets/cargo-pretty-itself.mp4" controls></video>
+  <video src="assets/cargo-pretty-itself.mp4" controls width="600"></video>
 </p>
 
 ## Install
@@ -62,7 +62,7 @@ harness (`--no-fail-fast`, a name filter, whatever you need).
 Testing was upgraded to provide a better output experience. Now, when a test fails, the output will include diff-coloring for `assert!` and `assert_eq!` panics, making it easier to identify what went wrong. Additionally, you can expand the information of a specific test by pressing `Enter`, and if you want to retry the test, simply press `r`. This makes debugging and iterating on tests much more efficient and user-friendly.
 
 <p align="center">
-  <img src="/assets/testing.gif" alt="testing">
+  <img src="/assets/testing.gif" alt="testing" width="1000">
 </p>
 
 
